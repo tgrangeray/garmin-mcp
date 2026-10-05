@@ -4,7 +4,7 @@ Nutrition/food logging functions for Garmin Connect MCP Server
 import datetime
 import json
 from copy import deepcopy
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from garminconnect import GarminConnectConnectionError
 
@@ -1055,5 +1055,114 @@ def register_tools(app):
             return f"Error in upsert_and_log: {e} | Response: {body}"
         except Exception as e:
             return f"Error in upsert_and_log: {str(e)}"
+
+    @app.tool()
+    async def log_meal(
+        meal_date: str,
+        meal_time: str,
+        items: List[Dict[str, Any]],
+    ) -> str:
+        """Log every food of a meal in a single call (batch Quick Add)
+
+        Meant for a meal described in free text: parse the text yourself,
+        estimate each food's macros, then send ALL items at once instead of
+        calling log_food once per food. The meal slot is resolved once from
+        meal_time (startTime/endTime windows, fallback SNACKS) and all items
+        are sent in one request. Returns a compact recap with meal totals.
+
+        The server does not parse text or look up nutrition values: the
+        numbers in items are the ones logged, so estimate them carefully.
+
+        Args:
+            meal_date: Date in YYYY-MM-DD format
+            meal_time: Time in HH:MM:SS format (account timezone)
+            items: Non-empty list of foods. Each item is an object with:
+                name (str, required), calories (kcal, required),
+                carbs, protein, fat (grams, optional, default 0)
+        """
+        try:
+            from datetime import datetime, timezone
+
+            if not items:
+                return "Error logging meal: 'items' must contain at least one food."
+            parsed = []
+            for i, item in enumerate(items):
+                name = str(item.get("name", "")).strip() if isinstance(item, dict) else ""
+                if not name or item.get("calories") is None:
+                    return (
+                        f"Error logging meal: item #{i + 1} needs a non-empty "
+                        "'name' and 'calories'. Nothing was logged."
+                    )
+                try:
+                    parsed.append({
+                        "name": name,
+                        "calories": float(item["calories"]),
+                        "carbs": float(item.get("carbs") or 0),
+                        "protein": float(item.get("protein") or 0),
+                        "fat": float(item.get("fat") or 0),
+                    })
+                except (TypeError, ValueError):
+                    return (
+                        f"Error logging meal: item #{i + 1} ('{name}') has a "
+                        "non-numeric macro value. Nothing was logged."
+                    )
+
+            meals_data = garmin_client.connectapi(f"/nutrition-service/meals/{meal_date}")
+            meals = (meals_data or {}).get("meals", [])
+            meal_id = None
+            meal_name = None
+            for m in meals:
+                start = m.get("startTime")
+                end = m.get("endTime")
+                if start and end and start <= meal_time <= end:
+                    meal_id, meal_name = m["mealId"], m.get("mealName")
+                    break
+            if meal_id is None:
+                snacks = next((m for m in meals if m.get("mealName") == "SNACKS"), None)
+                if snacks is None:
+                    return f"Error logging meal: could not match meal for time '{meal_time}' and no SNACKS meal found."
+                meal_id, meal_name = snacks["mealId"], "SNACKS"
+
+            log_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            payload = {
+                "mealDate": meal_date,
+                "quickAddItems": [
+                    {
+                        "name": p["name"],
+                        "logId": None,
+                        "logTimestamp": log_timestamp,
+                        "logSource": "GCW",
+                        "logCategory": "QUICK_ADD",
+                        "mealTime": meal_time,
+                        "mealId": meal_id,
+                        "action": "ADD",
+                        "calories": _num_to_str(p["calories"]),
+                        "carbs": _num_to_str(p["carbs"]),
+                        "protein": _num_to_str(p["protein"]),
+                        "fat": _num_to_str(p["fat"]),
+                    }
+                    for p in parsed
+                ],
+            }
+            garmin_client.client.put(
+                "connectapi", "/nutrition-service/food/logs/quickAdd", json=payload, api=True
+            )
+            return json.dumps({
+                "status": "success",
+                "meal_date": meal_date,
+                "meal": meal_name,
+                "items_logged": len(parsed),
+                "totals": {
+                    k: round(sum(p[k] for p in parsed), 1)
+                    for k in ("calories", "carbs", "protein", "fat")
+                },
+            }, indent=2)
+        except GarminConnectConnectionError as e:
+            body = ""
+            if hasattr(e, "error") and hasattr(e.error, "response"):
+                body = getattr(e.error.response, "text", "")
+            return f"Error logging meal: {e} | Response: {body}"
+        except Exception as e:
+            return f"Error logging meal: {str(e)}"
 
     return app

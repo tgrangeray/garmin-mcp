@@ -1373,3 +1373,58 @@ async def test_set_nutrition_settings_rejects_invalid_macros(app_with_nutrition,
     )
     assert "cannot apply update" in result[0][0].text
     mock_garmin_client.client.put.assert_not_called()
+
+
+# log_meal tests
+
+@pytest.mark.asyncio
+async def test_log_meal_batches_all_items_in_one_request(app_with_nutrition, mock_garmin_client):
+    """All foods go out in a single quickAdd PUT, with one meal lookup."""
+    mock_garmin_client.connectapi.return_value = MOCK_MEALS
+    mock_garmin_client.client.put.return_value = {}
+    result = await app_with_nutrition.call_tool(
+        "log_meal",
+        {
+            "meal_date": "2024-01-15",
+            "meal_time": "08:30:00",
+            "items": [
+                {"name": "Oeufs brouillés", "calories": 220, "protein": 14, "fat": 17, "carbs": 2},
+                {"name": "Pain complet", "calories": 120, "carbs": 22, "protein": 4, "fat": 1.5},
+            ],
+        },
+    )
+    data = json.loads(result[0][0].text)
+    assert data["items_logged"] == 2
+    assert data["totals"] == {"calories": 340.0, "carbs": 24.0, "protein": 18.0, "fat": 18.5}
+    mock_garmin_client.connectapi.assert_called_once_with("/nutrition-service/meals/2024-01-15")
+    mock_garmin_client.client.put.assert_called_once()
+    args, kwargs = mock_garmin_client.client.put.call_args
+    assert args[1] == "/nutrition-service/food/logs/quickAdd"
+    items = kwargs["json"]["quickAddItems"]
+    assert [i["name"] for i in items] == ["Oeufs brouillés", "Pain complet"]
+    assert all(i["mealId"] == 20249 for i in items)  # BREAKFAST
+
+
+@pytest.mark.asyncio
+async def test_log_meal_rejects_invalid_item_without_logging(app_with_nutrition, mock_garmin_client):
+    """A bad item aborts the whole batch before any API call."""
+    result = await app_with_nutrition.call_tool(
+        "log_meal",
+        {
+            "meal_date": "2024-01-15",
+            "meal_time": "12:00:00",
+            "items": [{"name": "Riz", "calories": 200}, {"name": "Poulet"}],
+        },
+    )
+    assert "item #2" in result[0][0].text
+    mock_garmin_client.client.put.assert_not_called()
+    mock_garmin_client.connectapi.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_log_meal_empty_items(app_with_nutrition, mock_garmin_client):
+    result = await app_with_nutrition.call_tool(
+        "log_meal", {"meal_date": "2024-01-15", "meal_time": "12:00:00", "items": []}
+    )
+    assert "at least one food" in result[0][0].text
+    mock_garmin_client.client.put.assert_not_called()
