@@ -35,7 +35,7 @@ This MCP server implements **110+ tools** covering ~90% of the [python-garmincon
 - ✅ Gear Management (5 tools)
 - ✅ Weight Tracking (5 tools)
 - ✅ Challenges & Badges (10 tools)
-- ✅ Nutrition (9 tools) - food logs, meals, custom foods, food logging, and multi-day intake summaries
+- ✅ Nutrition (17 tools) - food logs, meals, custom foods, food logging, multi-day intake summaries, and high-level meal logging (`find_foods`, `log_meal`)
 - ✅ Women's Health (3 tools)
 - ✅ User Profile (3 tools)
 - ✅ High-Level Workout Builders (4 tools) - create and schedule workouts without writing JSON
@@ -321,6 +321,96 @@ For a named Garmin HR zone, use the same target type with `zoneNumber` instead:
 Use either `zoneNumber` or `targetValueOne` / `targetValueTwo` on a target, not
 both. Garmin treats the named zone as authoritative and silently discards a
 coexisting custom range, so the upload tools reject that ambiguous shape.
+
+## High-level nutrition tools
+
+Log a meal described in plain text with two calls instead of one call per food.
+The server does not parse text or estimate nutrition: your LLM splits the text
+into foods, and these tools do the Garmin work. Garmin Connect then computes its
+own nutrition reports (macro split, trends) from real foods, so every food must
+carry calories, carbs, protein and fat **per 100 g**.
+
+Flow for *"2 eggs, 150 g of cooked basmati rice and a coffee"*:
+
+```text
+find_foods(queries=["cooked egg", "cooked basmati rice"])
+  → candidates with per-100 g macros, food_id, serving_id, serving_grams
+
+log_meal(meal_date="2026-10-05", meal_time="12:30:00", items=[...])
+  → one request, all foods logged
+```
+
+### `find_foods`
+
+Searches several foods in Garmin's FatSecret catalog in one call and returns
+compact candidates normalised per 100 g.
+
+```json
+{"queries": ["cooked basmati rice", "grilled chicken breast"], "limit_per_query": 5}
+```
+
+Returns, per query, a list of candidates:
+
+```json
+{
+  "food_id": "4852768",
+  "name": "Basmati Rice",
+  "source": "FATSECRET",
+  "per_100g": {"calories": 121.0, "carbs_g": 25.2, "protein_g": 3.5, "fat_g": 0.4},
+  "serving_id": "4723850",
+  "serving_grams": 100.0
+}
+```
+
+- **Write queries in English.** The catalog is English-only (region US); French
+  queries return mostly unrelated foods.
+- Candidates without a gram-based serving have `per_100g: null` and cannot be
+  logged by weight (no volume-to-weight conversion is attempted). Estimate them
+  and log them as a manual item.
+- It is the LLM, not the server, that picks the right candidate: the server never
+  auto-matches, to avoid silently logging "Rice pudding" for "Rice".
+
+### `log_meal`
+
+Logs every food of a meal in a single request. `meal_time` selects the meal
+from each meal's start/end window and falls back to `SNACKS`. Two kinds of
+items can be mixed:
+
+```json
+{
+  "meal_date": "2026-10-05",
+  "meal_time": "12:30:00",
+  "items": [
+    {"food_id": "4852768", "serving_id": "4723850", "serving_grams": 100, "grams": 150, "name": "Basmati rice"},
+    {"name": "Café noir", "grams": 200, "calories": 1, "carbs": 0, "protein": 0.1, "fat": 0}
+  ]
+}
+```
+
+| Item kind | Required fields | What happens |
+|-----------|-----------------|--------------|
+| Catalog | `food_id`, `serving_id`, `grams` (+ `serving_grams`, default 100; `source`, default `FATSECRET`) | Logged directly; nothing is created. Garmin also fills micronutrients. |
+| Manual | `name`, `grams`, `calories`, `carbs`, `protein`, `fat` (all per 100 g) | Found by name or created in your custom foods as a 100 g serving. |
+
+Behaviour worth knowing:
+
+- Quantity logged = `grams / serving_grams` (e.g. 150 g on a 100 g serving → 1.5).
+- Everything is validated and resolved **before** logging: an invalid or
+  unresolvable item aborts the whole call and nothing is logged. A manual food
+  created just before a later failure stays in your custom foods.
+- An existing custom food with the same name is reused as is, never overwritten;
+  the response carries a `notes` entry when the values you sent differ from the
+  stored ones. Use stable names (`"Riz basmati cuit"` and `"Riz"` are different
+  foods).
+- An existing custom food without a gram-based serving makes the call fail
+  rather than guess a conversion.
+- Manual values come from the LLM's estimate; prefer catalog items when a good
+  match exists.
+- A time outside the meal windows (e.g. `08:59:30`, after breakfast's
+  `08:59:00` end) falls back to `SNACKS`.
+
+Returns a short recap: meal, and for each item its name, grams, source and
+whether the food was created.
 
 ## One-click Install (Claude Desktop)
 

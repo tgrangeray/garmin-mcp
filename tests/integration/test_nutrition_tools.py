@@ -2,7 +2,7 @@
 Integration tests for nutrition module MCP tools
 
 Tests tools from:
-- nutrition (9 tools: 6 read + 2 write + 1 metadata)
+- nutrition (17 tools, incl. find_foods and log_meal)
 """
 import json
 from copy import deepcopy
