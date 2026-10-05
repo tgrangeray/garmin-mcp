@@ -66,6 +66,28 @@ def resolve_weight_goal_target_date(stored_target, date, target_date=None):
     return None, None
 
 
+def _gram_serving(contents):
+    """Pick the serving to use for gram-based logging: 100 g first, else any G."""
+    grams = [c for c in contents or [] if c.get("servingUnit") == "G" and c.get("servingId")]
+    for c in grams:
+        if float(c.get("numberOfUnits") or 0) == 100:
+            return c
+    return grams[0] if grams else None
+
+
+def _per_100g(serving):
+    """Macros of a gram serving normalised to 100 g (None if not computable)."""
+    units = float(serving.get("numberOfUnits") or 0)
+    if units <= 0:
+        return None
+    out = {}
+    for src, dst in (("calories", "calories"), ("carbs", "carbs_g"), ("protein", "protein_g"), ("fat", "fat_g")):
+        if serving.get(src) is None:
+            return None
+        out[dst] = round(float(serving[src]) * 100 / units, 1)
+    return out
+
+
 def configure(client):
     """Configure the module with the Garmin client instance"""
     global garmin_client
@@ -1057,6 +1079,56 @@ def register_tools(app):
             return f"Error in upsert_and_log: {str(e)}"
 
     @app.tool()
+    async def find_foods(queries: List[str], limit_per_query: int = 5) -> str:
+        """Look up several foods in Garmin's FatSecret catalog in ONE call
+
+        Use this BEFORE estimating nutrition values yourself: for each query
+        (e.g. "riz basmati cuit", "poulet grillé") it returns the best catalog
+        candidates with macros normalised per 100 g, in a compact form. Pick
+        the right candidate for each food, then pass its food_id, serving_id
+        and serving_grams to log_meal (catalog item). If no candidate fits,
+        estimate per-100 g values yourself and send a manual item instead.
+
+        Only candidates that have a gram-based serving are returned with
+        per-100 g values; others are listed with per_100g = null and cannot
+        be logged by weight.
+
+        Args:
+            queries: Food names to search, one entry per food
+            limit_per_query: Max candidates kept per query (default 5)
+        """
+        try:
+            if not queries:
+                return "Error searching foods: 'queries' must contain at least one food."
+            out = []
+            for q in queries:
+                data = garmin_client.connectapi(
+                    "/nutrition-service/food/search",
+                    params={"searchExpression": q, "start": 0, "limit": max(1, limit_per_query)},
+                )
+                raw = data.get("results", []) if isinstance(data, dict) else []
+                candidates = []
+                for item in raw[: max(1, limit_per_query)]:
+                    meta = item.get("foodMetaData", {})
+                    serving = _gram_serving(item.get("nutritionContents", []))
+                    cand = {
+                        "food_id": meta.get("foodId"),
+                        "name": meta.get("foodName"),
+                        "source": meta.get("source"),
+                        "per_100g": _per_100g(serving) if serving else None,
+                    }
+                    if meta.get("brandName"):
+                        cand["brand"] = meta["brandName"]
+                    if serving:
+                        cand["serving_id"] = serving.get("servingId")
+                        cand["serving_grams"] = float(serving.get("numberOfUnits") or 100)
+                    candidates.append(cand)
+                out.append({"query": q, "candidates": candidates})
+            return json.dumps(out, indent=2)
+        except Exception as e:
+            return f"Error searching foods: {str(e)}"
+
+    @app.tool()
     async def log_meal(
         meal_date: str,
         meal_time: str,
@@ -1070,11 +1142,17 @@ def register_tools(app):
         servingQty = grams / 100, so Garmin Connect computes its own
         nutrition reports (macro split, trends) from real foods.
 
-        The server does not parse text or look up nutrition values: the
-        per-100 g numbers you send are the ones stored, so use reliable
-        values. An existing custom food with the same name is reused as is
-        (its stored values are NOT overwritten); a note is returned when the
-        values you sent differ from the stored ones.
+        Two kinds of items can be mixed in one call:
+          - catalog item (preferred): a food found with find_foods. Give
+            food_id, serving_id, serving_grams and grams (source defaults to
+            "FATSECRET"). Logged directly, nothing is created.
+          - manual item: no catalog match, so you estimate the values; the
+            food is found-or-created in the user's custom library.
+
+        The server does not parse text or estimate nutrition: manual per-100 g
+        numbers are stored as sent, so use reliable values. An existing custom
+        food with the same name is reused as is (its stored values are NOT
+        overwritten); a note is returned when the values you sent differ.
 
         Nothing is logged if any item is invalid or cannot be resolved.
 
@@ -1082,9 +1160,10 @@ def register_tools(app):
             meal_date: Date in YYYY-MM-DD format
             meal_time: Time in HH:MM:SS format (account timezone); selects
                 the meal (fallback SNACKS)
-            items: Non-empty list of foods, each an object with ALL of:
-                name (str), grams (quantity eaten, > 0),
-                calories, carbs, protein, fat (all per 100 g, >= 0)
+            items: Non-empty list of foods. Catalog item: food_id, serving_id,
+                serving_grams, grams, optional name/source. Manual item: ALL of
+                name, grams (quantity eaten, > 0), calories, carbs, protein,
+                fat (all per 100 g, >= 0)
         """
         try:
             from datetime import datetime, timezone
@@ -1098,6 +1177,29 @@ def register_tools(app):
                 if not isinstance(item, dict):
                     return f"Error logging meal: {label} must be an object. Nothing was logged."
                 name = str(item.get("name", "")).strip()
+                if item.get("food_id"):
+                    missing = [k for k in ("serving_id", "grams") if item.get(k) is None]
+                    if missing:
+                        return (
+                            f"Error logging meal: catalog {label} needs food_id, serving_id "
+                            f"and grams; missing: {', '.join(missing)}. Nothing was logged."
+                        )
+                    try:
+                        entry = {
+                            "catalog": True,
+                            "name": name or str(item["food_id"]),
+                            "grams": float(item["grams"]),
+                            "food_id": str(item["food_id"]),
+                            "serving_id": str(item["serving_id"]),
+                            "serving_grams": float(item.get("serving_grams") or 100),
+                            "source": str(item.get("source") or "FATSECRET"),
+                        }
+                    except (TypeError, ValueError):
+                        return f"Error logging meal: catalog {label} has a non-numeric value. Nothing was logged."
+                    if entry["grams"] <= 0 or entry["serving_grams"] <= 0:
+                        return f"Error logging meal: catalog {label} needs grams > 0 and serving_grams > 0. Nothing was logged."
+                    parsed.append(entry)
+                    continue
                 missing = [k for k in ("grams",) + macro_keys if item.get(k) is None]
                 if not name or missing:
                     return (
@@ -1134,17 +1236,20 @@ def register_tools(app):
                             return str(meta.get("foodId") or f.get("foodId", "")), contents
                 return None, None
 
-            def pick_serving(contents):
-                """Prefer a 100 g serving; else any gram serving."""
-                grams_servings = [c for c in contents if c.get("servingUnit") == "G"]
-                for c in grams_servings:
-                    if float(c.get("numberOfUnits") or 0) == 100:
-                        return c
-                return grams_servings[0] if grams_servings else None
-
             # Resolve (find or create) every food BEFORE logging anything.
             resolved = []
             for entry in parsed:
+                if entry.get("catalog"):
+                    resolved.append({
+                        "entry": entry,
+                        "food_id": entry["food_id"],
+                        "serving_id": entry["serving_id"],
+                        "source": entry["source"],
+                        "qty": entry["grams"] / entry["serving_grams"],
+                        "created": False,
+                        "notes": [],
+                    })
+                    continue
                 notes = []
                 created = False
                 food_id, contents = find_food(entry["name"])
@@ -1175,7 +1280,7 @@ def register_tools(app):
                         food_id, contents = find_food(entry["name"])
                     if not food_id or not contents:
                         return f"Error logging meal: could not retrieve foodId/servingId for '{entry['name']}' after creation. Nothing was logged."
-                serving = pick_serving(contents)
+                serving = _gram_serving(contents)
                 if serving is None or not serving.get("servingId"):
                     return (
                         f"Error logging meal: existing food '{entry['name']}' has no "
@@ -1193,6 +1298,7 @@ def register_tools(app):
                     "entry": entry,
                     "food_id": food_id,
                     "serving_id": str(serving["servingId"]),
+                    "source": "GARMIN",
                     "qty": entry["grams"] / units,
                     "created": created,
                     "notes": notes,
@@ -1227,7 +1333,7 @@ def register_tools(app):
                         "mealId": meal_id,
                         "foodId": r["food_id"],
                         "servingId": r["serving_id"],
-                        "source": "GARMIN",
+                        "source": r["source"],
                         "regionCode": "US",
                         "languageCode": "en",
                         "servingQty": r["qty"],
@@ -1247,15 +1353,12 @@ def register_tools(app):
                     {
                         "name": r["entry"]["name"],
                         "grams": r["entry"]["grams"],
+                        "source": r["source"],
                         "food_created": r["created"],
                         **({"notes": r["notes"]} if r["notes"] else {}),
                     }
                     for r in resolved
                 ],
-                "totals_estimated_from_sent_values": {
-                    k: round(sum(r["entry"][k] * r["entry"]["grams"] / 100 for r in resolved), 1)
-                    for k in macro_keys
-                },
             }
             return json.dumps(result, indent=2)
         except GarminConnectConnectionError as e:

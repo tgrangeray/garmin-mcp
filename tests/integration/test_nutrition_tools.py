@@ -1399,7 +1399,6 @@ async def test_log_meal_creates_missing_foods_and_logs_in_one_request(app_with_n
     )
     data = json.loads(result[0][0].text)
     assert data["items"][0]["food_created"] is True
-    assert data["totals_estimated_from_sent_values"]["calories"] == 195.0
     create_call, log_call = mock_garmin_client.client.put.call_args_list
     nc = create_call[1]["json"]["nutritionContents"][0]
     assert nc["servingUnit"] == "G" and nc["numberOfUnits"] == "100" and nc["calories"] == "130"
@@ -1472,4 +1471,72 @@ async def test_log_meal_empty_items(app_with_nutrition, mock_garmin_client):
         "log_meal", {"meal_date": "2024-01-15", "meal_time": "12:00:00", "items": []}
     )
     assert "at least one food" in result[0][0].text
+    mock_garmin_client.client.put.assert_not_called()
+
+
+# find_foods / catalog items in log_meal
+
+_CATALOG = {"results": [
+    {
+        "foodMetaData": {"foodId": "777", "foodName": "Riz basmati cuit", "source": "FATSECRET"},
+        "nutritionContents": [
+            {"servingId": "s_cup", "servingUnit": "cup", "numberOfUnits": 1, "calories": 200, "carbs": 44, "protein": 4, "fat": 0.5},
+            {"servingId": "s_g", "servingUnit": "G", "numberOfUnits": 200, "calories": 260, "carbs": 56, "protein": 5.4, "fat": 0.6},
+        ],
+    },
+    {
+        "foodMetaData": {"foodId": "888", "foodName": "Riz au lait", "source": "FATSECRET", "brandName": "X"},
+        "nutritionContents": [
+            {"servingId": "s_cup2", "servingUnit": "cup", "numberOfUnits": 1, "calories": 300, "carbs": 50, "protein": 8, "fat": 6},
+        ],
+    },
+]}
+
+
+@pytest.mark.asyncio
+async def test_find_foods_normalises_per_100g(app_with_nutrition, mock_garmin_client):
+    mock_garmin_client.connectapi.side_effect = [_CATALOG, {"results": []}]
+    result = await app_with_nutrition.call_tool("find_foods", {"queries": ["riz basmati", "inconnu"]})
+    data = json.loads(result[0][0].text)
+    assert [d["query"] for d in data] == ["riz basmati", "inconnu"]
+    first, second = data[0]["candidates"]
+    assert first["per_100g"] == {"calories": 130.0, "carbs_g": 28.0, "protein_g": 2.7, "fat_g": 0.3}
+    assert first["serving_id"] == "s_g" and first["serving_grams"] == 200.0
+    assert second["per_100g"] is None and "serving_id" not in second and second["brand"] == "X"
+    assert data[1]["candidates"] == []
+    assert mock_garmin_client.connectapi.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_find_foods_empty_queries(app_with_nutrition, mock_garmin_client):
+    result = await app_with_nutrition.call_tool("find_foods", {"queries": []})
+    assert "at least one food" in result[0][0].text
+    mock_garmin_client.connectapi.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_log_meal_catalog_item_logged_without_creation(app_with_nutrition, mock_garmin_client):
+    """Catalog item: source FATSECRET, qty = grams / serving_grams, no custom food lookup/creation."""
+    mock_garmin_client.connectapi.side_effect = [MOCK_MEALS]  # only the meal lookup
+    mock_garmin_client.client.put.return_value = {}
+    result = await app_with_nutrition.call_tool(
+        "log_meal",
+        {"meal_date": "2024-01-15", "meal_time": "12:00:00",
+         "items": [{"food_id": "777", "serving_id": "s_g", "serving_grams": 200, "grams": 300, "name": "Riz"}]},
+    )
+    data = json.loads(result[0][0].text)
+    assert data["items"][0]["source"] == "FATSECRET" and data["items"][0]["food_created"] is False
+    mock_garmin_client.client.put.assert_called_once()
+    item = mock_garmin_client.client.put.call_args[1]["json"]["foodLogItems"][0]
+    assert item["source"] == "FATSECRET" and item["foodId"] == "777"
+    assert item["servingId"] == "s_g" and item["servingQty"] == 1.5
+
+
+@pytest.mark.asyncio
+async def test_log_meal_catalog_item_missing_serving_id(app_with_nutrition, mock_garmin_client):
+    result = await app_with_nutrition.call_tool(
+        "log_meal",
+        {"meal_date": "2024-01-15", "meal_time": "12:00:00", "items": [{"food_id": "777", "grams": 100}]},
+    )
+    assert "serving_id" in result[0][0].text and "Nothing was logged" in result[0][0].text
     mock_garmin_client.client.put.assert_not_called()
