@@ -4,7 +4,7 @@ Nutrition/food logging functions for Garmin Connect MCP Server
 import datetime
 import json
 from copy import deepcopy
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from garminconnect import GarminConnectConnectionError
 
@@ -64,6 +64,32 @@ def resolve_weight_goal_target_date(stored_target, date, target_date=None):
         )
 
     return None, None
+
+
+def _gram_serving(contents):
+    """Pick the serving to use for gram-based logging: 100 g first, else any G."""
+    # Catalog (FatSecret) servings use "g", custom foods use "G".
+    grams = [
+        c for c in contents or []
+        if str(c.get("servingUnit", "")).strip().lower() == "g" and c.get("servingId")
+    ]
+    for c in grams:
+        if float(c.get("numberOfUnits") or 0) == 100:
+            return c
+    return grams[0] if grams else None
+
+
+def _per_100g(serving):
+    """Macros of a gram serving normalised to 100 g (None if not computable)."""
+    units = float(serving.get("numberOfUnits") or 0)
+    if units <= 0:
+        return None
+    out = {}
+    for src, dst in (("calories", "calories"), ("carbs", "carbs_g"), ("protein", "protein_g"), ("fat", "fat_g")):
+        if serving.get(src) is None:
+            return None
+        out[dst] = round(float(serving[src]) * 100 / units, 1)
+    return out
 
 
 def configure(client):
@@ -1055,5 +1081,299 @@ def register_tools(app):
             return f"Error in upsert_and_log: {e} | Response: {body}"
         except Exception as e:
             return f"Error in upsert_and_log: {str(e)}"
+
+    @app.tool()
+    async def find_foods(queries: List[str], limit_per_query: int = 5) -> str:
+        """Look up several foods in Garmin's FatSecret catalog in ONE call
+
+        Use this BEFORE estimating nutrition values yourself: for each query
+        (e.g. "cooked basmati rice", "grilled chicken breast") it returns the best catalog
+        candidates with macros normalised per 100 g, in a compact form. Pick
+        the right candidate for each food, then pass its food_id, serving_id
+        and serving_grams to log_meal (catalog item). If no candidate fits,
+        estimate per-100 g values yourself and send a manual item instead.
+
+        Write queries in ENGLISH: the catalog is English-only (region US),
+        and French queries return mostly unrelated foods.
+
+        Only candidates that have a gram-based serving are returned with
+        per-100 g values; others are listed with per_100g = null and cannot
+        be logged by weight.
+
+        Args:
+            queries: Food names to search, one entry per food
+            limit_per_query: Max candidates kept per query (default 5)
+        """
+        try:
+            if not queries:
+                return "Error searching foods: 'queries' must contain at least one food."
+            out = []
+            for q in queries:
+                data = garmin_client.connectapi(
+                    "/nutrition-service/food/search",
+                    params={"searchExpression": q, "start": 0, "limit": max(1, limit_per_query)},
+                )
+                raw = data.get("results", []) if isinstance(data, dict) else []
+                candidates = []
+                for item in raw[: max(1, limit_per_query)]:
+                    meta = item.get("foodMetaData", {})
+                    serving = _gram_serving(item.get("nutritionContents", []))
+                    cand = {
+                        "food_id": meta.get("foodId"),
+                        "name": meta.get("foodName"),
+                        "source": meta.get("source"),
+                        "per_100g": _per_100g(serving) if serving else None,
+                    }
+                    if meta.get("brandName"):
+                        cand["brand"] = meta["brandName"]
+                    if serving:
+                        cand["serving_id"] = serving.get("servingId")
+                        cand["serving_grams"] = float(serving.get("numberOfUnits") or 100)
+                    candidates.append(cand)
+                out.append({"query": q, "candidates": candidates})
+            return json.dumps(out, indent=2)
+        except Exception as e:
+            return f"Error searching foods: {str(e)}"
+
+    @app.tool()
+    async def log_meal(
+        meal_date: str,
+        meal_time: str,
+        items: List[Dict[str, Any]],
+    ) -> str:
+        """Log every food of a meal in a single call, with per-100 g nutrition
+
+        Meant for a meal described in free text: parse the text yourself,
+        then send ALL foods at once. Each food is found-or-created in the
+        user's Garmin custom food library as a "100 g" serving and logged with
+        servingQty = grams / 100, so Garmin Connect computes its own
+        nutrition reports (macro split, trends) from real foods.
+
+        Two kinds of items can be mixed in one call:
+          - catalog item (preferred): a food found with find_foods. Give
+            food_id, serving_id, serving_grams and grams (source defaults to
+            "FATSECRET"). Logged directly, nothing is created.
+          - manual item: no catalog match, so you estimate the values; the
+            food is found-or-created in the user's custom library.
+
+        The server does not parse text or estimate nutrition: manual per-100 g
+        numbers are stored as sent, so use reliable values. An existing custom
+        food with the same name is reused as is (its stored values are NOT
+        overwritten); a note is returned when the values you sent differ.
+
+        Nothing is logged if any item is invalid or cannot be resolved.
+
+        Args:
+            meal_date: Date in YYYY-MM-DD format
+            meal_time: Time in HH:MM:SS format (account timezone); selects
+                the meal (fallback SNACKS)
+            items: Non-empty list of foods. Catalog item: food_id, serving_id,
+                serving_grams, grams, optional name/source. Manual item: ALL of
+                name, grams (quantity eaten, > 0), calories, carbs, protein,
+                fat (all per 100 g, >= 0)
+        """
+        try:
+            from datetime import datetime, timezone
+
+            if not items:
+                return "Error logging meal: 'items' must contain at least one food."
+            macro_keys = ("calories", "carbs", "protein", "fat")
+            parsed = []
+            for i, item in enumerate(items):
+                label = f"item #{i + 1}"
+                if not isinstance(item, dict):
+                    return f"Error logging meal: {label} must be an object. Nothing was logged."
+                name = str(item.get("name", "")).strip()
+                if item.get("food_id"):
+                    missing = [k for k in ("serving_id", "grams") if item.get(k) is None]
+                    if missing:
+                        return (
+                            f"Error logging meal: catalog {label} needs food_id, serving_id "
+                            f"and grams; missing: {', '.join(missing)}. Nothing was logged."
+                        )
+                    try:
+                        entry = {
+                            "catalog": True,
+                            "name": name or str(item["food_id"]),
+                            "grams": float(item["grams"]),
+                            "food_id": str(item["food_id"]),
+                            "serving_id": str(item["serving_id"]),
+                            "serving_grams": float(item.get("serving_grams") or 100),
+                            "source": str(item.get("source") or "FATSECRET"),
+                        }
+                    except (TypeError, ValueError):
+                        return f"Error logging meal: catalog {label} has a non-numeric value. Nothing was logged."
+                    if entry["grams"] <= 0 or entry["serving_grams"] <= 0:
+                        return f"Error logging meal: catalog {label} needs grams > 0 and serving_grams > 0. Nothing was logged."
+                    parsed.append(entry)
+                    continue
+                missing = [k for k in ("grams",) + macro_keys if item.get(k) is None]
+                if not name or missing:
+                    return (
+                        f"Error logging meal: {label} needs 'name' plus "
+                        "grams, calories, carbs, protein, fat (per 100 g)"
+                        + (f"; missing: {', '.join(missing)}" if missing else "")
+                        + ". Nothing was logged."
+                    )
+                try:
+                    entry = {"name": name, "grams": float(item["grams"])}
+                    entry.update({k: float(item[k]) for k in macro_keys})
+                except (TypeError, ValueError):
+                    return f"Error logging meal: {label} ('{name}') has a non-numeric value. Nothing was logged."
+                if entry["grams"] <= 0 or any(entry[k] < 0 for k in macro_keys):
+                    return f"Error logging meal: {label} ('{name}') needs grams > 0 and non-negative macros. Nothing was logged."
+                parsed.append(entry)
+
+            def find_food(food_name):
+                data = garmin_client.connectapi(
+                    "/nutrition-service/customFood",
+                    params={
+                        "searchExpression": food_name,
+                        "start": 0,
+                        "limit": 10,
+                        "includeContent": "true",
+                    },
+                )
+                foods = data.get("customFoods", []) if isinstance(data, dict) else []
+                for f in foods:
+                    meta = f.get("foodMetaData", f)
+                    if meta.get("foodName", "").lower() == food_name.lower():
+                        contents = f.get("nutritionContents", [])
+                        if contents:
+                            return str(meta.get("foodId") or f.get("foodId", "")), contents
+                return None, None
+
+            # Resolve (find or create) every food BEFORE logging anything.
+            resolved = []
+            for entry in parsed:
+                if entry.get("catalog"):
+                    resolved.append({
+                        "entry": entry,
+                        "food_id": entry["food_id"],
+                        "serving_id": entry["serving_id"],
+                        "source": entry["source"],
+                        "qty": entry["grams"] / entry["serving_grams"],
+                        "created": False,
+                        "notes": [],
+                    })
+                    continue
+                notes = []
+                created = False
+                food_id, contents = find_food(entry["name"])
+                if not food_id:
+                    create_payload = {
+                        "foodMetaData": {
+                            "foodName": entry["name"],
+                            "foodType": "GENERIC",
+                            "source": "GARMIN",
+                            "regionCode": "US",
+                            "languageCode": "en",
+                        },
+                        "nutritionContents": [{
+                            "servingUnit": "G",
+                            "numberOfUnits": "100",
+                            **{k: _num_to_str(entry[k]) for k in macro_keys},
+                        }],
+                    }
+                    resp = garmin_client.client.put(
+                        "connectapi", "/nutrition-service/customFood", json=create_payload, api=True
+                    )
+                    created = True
+                    if resp:
+                        meta = resp.get("foodMetaData", resp)
+                        food_id = str(meta.get("foodId", ""))
+                        contents = resp.get("nutritionContents", [])
+                    if not food_id or not contents:
+                        food_id, contents = find_food(entry["name"])
+                    if not food_id or not contents:
+                        return f"Error logging meal: could not retrieve foodId/servingId for '{entry['name']}' after creation. Nothing was logged."
+                serving = _gram_serving(contents)
+                if serving is None or not serving.get("servingId"):
+                    return (
+                        f"Error logging meal: existing food '{entry['name']}' has no "
+                        "gram-based serving; rename the food or fix it in Garmin. Nothing was logged."
+                    )
+                units = float(serving.get("numberOfUnits") or 100)
+                if not created:
+                    for k in macro_keys:
+                        stored = serving.get(k)
+                        if stored is not None and units and abs(float(stored) * 100 / units - entry[k]) > 0.5:
+                            notes.append(
+                                f"stored {k} differs from the {k} sent per 100 g; stored value used"
+                            )
+                resolved.append({
+                    "entry": entry,
+                    "food_id": food_id,
+                    "serving_id": str(serving["servingId"]),
+                    "source": "GARMIN",
+                    "qty": entry["grams"] / units,
+                    "created": created,
+                    "notes": notes,
+                })
+
+            meals_data = garmin_client.connectapi(f"/nutrition-service/meals/{meal_date}")
+            meals = (meals_data or {}).get("meals", [])
+            meal_id = None
+            meal_name = None
+            for m in meals:
+                start = m.get("startTime")
+                end = m.get("endTime")
+                if start and end and start <= meal_time <= end:
+                    meal_id, meal_name = m["mealId"], m.get("mealName")
+                    break
+            if meal_id is None:
+                snacks = next((m for m in meals if m.get("mealName") == "SNACKS"), None)
+                if snacks is None:
+                    return f"Error logging meal: could not match meal for time '{meal_time}' and no SNACKS meal found."
+                meal_id, meal_name = snacks["mealId"], "SNACKS"
+
+            log_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            payload = {
+                "mealDate": meal_date,
+                "foodLogItems": [
+                    {
+                        "logTimestamp": log_timestamp,
+                        "logSource": "GCW",
+                        "logCategory": "REGULAR_LOG",
+                        "mealTime": meal_time,
+                        "action": "ADD",
+                        "mealId": meal_id,
+                        "foodId": r["food_id"],
+                        "servingId": r["serving_id"],
+                        "source": r["source"],
+                        "regionCode": "US",
+                        "languageCode": "en",
+                        "servingQty": r["qty"],
+                    }
+                    for r in resolved
+                ],
+            }
+            garmin_client.client.put(
+                "connectapi", "/nutrition-service/food/logs", json=payload, api=True
+            )
+
+            result = {
+                "status": "success",
+                "meal_date": meal_date,
+                "meal": meal_name,
+                "items": [
+                    {
+                        "name": r["entry"]["name"],
+                        "grams": r["entry"]["grams"],
+                        "source": r["source"],
+                        "food_created": r["created"],
+                        **({"notes": r["notes"]} if r["notes"] else {}),
+                    }
+                    for r in resolved
+                ],
+            }
+            return json.dumps(result, indent=2)
+        except GarminConnectConnectionError as e:
+            body = ""
+            if hasattr(e, "error") and hasattr(e.error, "response"):
+                body = getattr(e.error.response, "text", "")
+            return f"Error logging meal: {e} | Response: {body}"
+        except Exception as e:
+            return f"Error logging meal: {str(e)}"
 
     return app

@@ -2,7 +2,7 @@
 Integration tests for nutrition module MCP tools
 
 Tests tools from:
-- nutrition (9 tools: 6 read + 2 write + 1 metadata)
+- nutrition (17 tools, incl. find_foods and log_meal)
 """
 import json
 from copy import deepcopy
@@ -1373,3 +1373,188 @@ async def test_set_nutrition_settings_rejects_invalid_macros(app_with_nutrition,
     )
     assert "cannot apply update" in result[0][0].text
     mock_garmin_client.client.put.assert_not_called()
+
+
+# log_meal tests
+
+@pytest.mark.asyncio
+async def test_log_meal_creates_missing_foods_and_logs_in_one_request(app_with_nutrition, mock_garmin_client):
+    """New foods are created per 100 g; all are logged in one PUT with qty = g/100."""
+    created = {
+        "foodMetaData": {"foodId": "newfood", "foodName": "Riz"},
+        "nutritionContents": [{"servingId": "newsrv", "servingUnit": "G", "numberOfUnits": 100}],
+    }
+    mock_garmin_client.connectapi.side_effect = [
+        {"customFoods": []},  # search Riz
+        MOCK_MEALS,           # meal resolution
+    ]
+    mock_garmin_client.client.put.side_effect = [created, {}]
+    result = await app_with_nutrition.call_tool(
+        "log_meal",
+        {
+            "meal_date": "2024-01-15",
+            "meal_time": "12:00:00",
+            "items": [{"name": "Riz", "grams": 150, "calories": 130, "carbs": 28, "protein": 2.7, "fat": 0.3}],
+        },
+    )
+    data = json.loads(result[0][0].text)
+    assert data["items"][0]["food_created"] is True
+    create_call, log_call = mock_garmin_client.client.put.call_args_list
+    nc = create_call[1]["json"]["nutritionContents"][0]
+    assert nc["servingUnit"] == "G" and nc["numberOfUnits"] == "100" and nc["calories"] == "130"
+    log_items = log_call[1]["json"]["foodLogItems"]
+    assert len(log_items) == 1
+    assert log_items[0]["foodId"] == "newfood" and log_items[0]["servingQty"] == 1.5
+
+
+@pytest.mark.asyncio
+async def test_log_meal_reuses_existing_food(app_with_nutrition, mock_garmin_client):
+    """An existing food with the same name is reused, no creation."""
+    existing = {"customFoods": [{
+        "foodMetaData": {"foodId": "food001", "foodName": "Greek Yogurt"},
+        "nutritionContents": [{"servingId": "srv001", "servingUnit": "G", "numberOfUnits": 100, "calories": 59, "carbs": 3.6, "protein": 10, "fat": 0.4}],
+    }]}
+    mock_garmin_client.connectapi.side_effect = [existing, MOCK_MEALS]
+    mock_garmin_client.client.put.return_value = {}
+    result = await app_with_nutrition.call_tool(
+        "log_meal",
+        {
+            "meal_date": "2024-01-15",
+            "meal_time": "08:30:00",
+            "items": [{"name": "greek yogurt", "grams": 200, "calories": 59, "carbs": 3.6, "protein": 10, "fat": 0.4}],
+        },
+    )
+    data = json.loads(result[0][0].text)
+    assert data["items"][0]["food_created"] is False
+    assert "notes" not in data["items"][0]
+    mock_garmin_client.client.put.assert_called_once()
+    item = mock_garmin_client.client.put.call_args[1]["json"]["foodLogItems"][0]
+    assert item["servingId"] == "srv001" and item["servingQty"] == 2.0 and item["mealId"] == 20249
+
+
+@pytest.mark.asyncio
+async def test_log_meal_flags_differing_stored_values(app_with_nutrition, mock_garmin_client):
+    existing = {"customFoods": [{
+        "foodMetaData": {"foodId": "f", "foodName": "Pain"},
+        "nutritionContents": [{"servingId": "s", "servingUnit": "G", "numberOfUnits": 100, "calories": 250, "carbs": 49, "protein": 9, "fat": 3}],
+    }]}
+    mock_garmin_client.connectapi.side_effect = [existing, MOCK_MEALS]
+    mock_garmin_client.client.put.return_value = {}
+    result = await app_with_nutrition.call_tool(
+        "log_meal",
+        {"meal_date": "2024-01-15", "meal_time": "08:30:00",
+         "items": [{"name": "Pain", "grams": 50, "calories": 300, "carbs": 49, "protein": 9, "fat": 3}]},
+    )
+    data = json.loads(result[0][0].text)
+    assert any("calories" in n for n in data["items"][0]["notes"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_item", [
+    {"name": "Poulet", "grams": 100, "calories": 165, "carbs": 0, "protein": 31},  # fat missing
+    {"name": "Poulet", "calories": 165, "carbs": 0, "protein": 31, "fat": 3.6},    # grams missing
+    {"name": "Poulet", "grams": 0, "calories": 165, "carbs": 0, "protein": 31, "fat": 3.6},
+])
+async def test_log_meal_rejects_incomplete_item_without_any_call(app_with_nutrition, mock_garmin_client, bad_item):
+    good = {"name": "Riz", "grams": 100, "calories": 130, "carbs": 28, "protein": 2.7, "fat": 0.3}
+    result = await app_with_nutrition.call_tool(
+        "log_meal", {"meal_date": "2024-01-15", "meal_time": "12:00:00", "items": [good, bad_item]}
+    )
+    assert "item #2" in result[0][0].text and "Nothing was logged" in result[0][0].text
+    mock_garmin_client.client.put.assert_not_called()
+    mock_garmin_client.connectapi.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_log_meal_empty_items(app_with_nutrition, mock_garmin_client):
+    result = await app_with_nutrition.call_tool(
+        "log_meal", {"meal_date": "2024-01-15", "meal_time": "12:00:00", "items": []}
+    )
+    assert "at least one food" in result[0][0].text
+    mock_garmin_client.client.put.assert_not_called()
+
+
+# find_foods / catalog items in log_meal
+
+_CATALOG = {"results": [
+    {
+        "foodMetaData": {"foodId": "777", "foodName": "Riz basmati cuit", "source": "FATSECRET"},
+        "nutritionContents": [
+            {"servingId": "s_cup", "servingUnit": "cup", "numberOfUnits": 1, "calories": 200, "carbs": 44, "protein": 4, "fat": 0.5},
+            {"servingId": "s_g", "servingUnit": "g", "numberOfUnits": 200, "calories": 260, "carbs": 56, "protein": 5.4, "fat": 0.6},
+        ],
+    },
+    {
+        "foodMetaData": {"foodId": "888", "foodName": "Riz au lait", "source": "FATSECRET", "brandName": "X"},
+        "nutritionContents": [
+            {"servingId": "s_cup2", "servingUnit": "cup", "numberOfUnits": 1, "calories": 300, "carbs": 50, "protein": 8, "fat": 6},
+        ],
+    },
+]}
+
+
+@pytest.mark.asyncio
+async def test_find_foods_normalises_per_100g(app_with_nutrition, mock_garmin_client):
+    mock_garmin_client.connectapi.side_effect = [_CATALOG, {"results": []}]
+    result = await app_with_nutrition.call_tool("find_foods", {"queries": ["riz basmati", "inconnu"]})
+    data = json.loads(result[0][0].text)
+    assert [d["query"] for d in data] == ["riz basmati", "inconnu"]
+    first, second = data[0]["candidates"]
+    assert first["per_100g"] == {"calories": 130.0, "carbs_g": 28.0, "protein_g": 2.7, "fat_g": 0.3}
+    assert first["serving_id"] == "s_g" and first["serving_grams"] == 200.0
+    assert second["per_100g"] is None and "serving_id" not in second and second["brand"] == "X"
+    assert data[1]["candidates"] == []
+    assert mock_garmin_client.connectapi.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_find_foods_empty_queries(app_with_nutrition, mock_garmin_client):
+    result = await app_with_nutrition.call_tool("find_foods", {"queries": []})
+    assert "at least one food" in result[0][0].text
+    mock_garmin_client.connectapi.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_log_meal_catalog_item_logged_without_creation(app_with_nutrition, mock_garmin_client):
+    """Catalog item: source FATSECRET, qty = grams / serving_grams, no custom food lookup/creation."""
+    mock_garmin_client.connectapi.side_effect = [MOCK_MEALS]  # only the meal lookup
+    mock_garmin_client.client.put.return_value = {}
+    result = await app_with_nutrition.call_tool(
+        "log_meal",
+        {"meal_date": "2024-01-15", "meal_time": "12:00:00",
+         "items": [{"food_id": "777", "serving_id": "s_g", "serving_grams": 200, "grams": 300, "name": "Riz"}]},
+    )
+    data = json.loads(result[0][0].text)
+    assert data["items"][0]["source"] == "FATSECRET" and data["items"][0]["food_created"] is False
+    mock_garmin_client.client.put.assert_called_once()
+    item = mock_garmin_client.client.put.call_args[1]["json"]["foodLogItems"][0]
+    assert item["source"] == "FATSECRET" and item["foodId"] == "777"
+    assert item["servingId"] == "s_g" and item["servingQty"] == 1.5
+
+
+@pytest.mark.asyncio
+async def test_log_meal_catalog_item_missing_serving_id(app_with_nutrition, mock_garmin_client):
+    result = await app_with_nutrition.call_tool(
+        "log_meal",
+        {"meal_date": "2024-01-15", "meal_time": "12:00:00", "items": [{"food_id": "777", "grams": 100}]},
+    )
+    assert "serving_id" in result[0][0].text and "Nothing was logged" in result[0][0].text
+    mock_garmin_client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_find_foods_real_catalog_shape_lowercase_g_100(app_with_nutrition, mock_garmin_client):
+    """Shape observed live: unit is lowercase 'g' with numberOfUnits 100.0 among other servings."""
+    live = {"results": [{
+        "foodMetaData": {"foodId": "4852768", "foodName": "Basmati Rice", "source": "FATSECRET",
+                         "foodType": "GENERIC", "regionCode": "US", "languageCode": "en"},
+        "nutritionContents": [
+            {"servingId": "4723846", "servingUnit": "cup cooked", "numberOfUnits": 1.0, "calories": 191, "carbs": 39.85, "protein": 5.59, "fat": 0.61},
+            {"servingId": "4723850", "servingUnit": "g", "numberOfUnits": 100.0, "calories": 121, "carbs": 25.22, "protein": 3.54, "fat": 0.38},
+        ],
+    }]}
+    mock_garmin_client.connectapi.return_value = live
+    result = await app_with_nutrition.call_tool("find_foods", {"queries": ["cooked basmati rice"]})
+    cand = json.loads(result[0][0].text)[0]["candidates"][0]
+    assert cand["serving_id"] == "4723850" and cand["serving_grams"] == 100.0
+    assert cand["per_100g"] == {"calories": 121.0, "carbs_g": 25.2, "protein_g": 3.5, "fat_g": 0.4}
