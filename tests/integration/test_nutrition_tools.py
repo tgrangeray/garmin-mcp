@@ -1481,7 +1481,7 @@ _CATALOG = {"results": [
         "foodMetaData": {"foodId": "777", "foodName": "Riz basmati cuit", "source": "FATSECRET"},
         "nutritionContents": [
             {"servingId": "s_cup", "servingUnit": "cup", "numberOfUnits": 1, "calories": 200, "carbs": 44, "protein": 4, "fat": 0.5},
-            {"servingId": "s_g", "servingUnit": "G", "numberOfUnits": 200, "calories": 260, "carbs": 56, "protein": 5.4, "fat": 0.6},
+            {"servingId": "s_g", "servingUnit": "g", "numberOfUnits": 200, "calories": 260, "carbs": 56, "protein": 5.4, "fat": 0.6},
         ],
     },
     {
@@ -1540,3 +1540,21 @@ async def test_log_meal_catalog_item_missing_serving_id(app_with_nutrition, mock
     )
     assert "serving_id" in result[0][0].text and "Nothing was logged" in result[0][0].text
     mock_garmin_client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_find_foods_real_catalog_shape_lowercase_g_100(app_with_nutrition, mock_garmin_client):
+    """Shape observed live: unit is lowercase 'g' with numberOfUnits 100.0 among other servings."""
+    live = {"results": [{
+        "foodMetaData": {"foodId": "4852768", "foodName": "Basmati Rice", "source": "FATSECRET",
+                         "foodType": "GENERIC", "regionCode": "US", "languageCode": "en"},
+        "nutritionContents": [
+            {"servingId": "4723846", "servingUnit": "cup cooked", "numberOfUnits": 1.0, "calories": 191, "carbs": 39.85, "protein": 5.59, "fat": 0.61},
+            {"servingId": "4723850", "servingUnit": "g", "numberOfUnits": 100.0, "calories": 121, "carbs": 25.22, "protein": 3.54, "fat": 0.38},
+        ],
+    }]}
+    mock_garmin_client.connectapi.return_value = live
+    result = await app_with_nutrition.call_tool("find_foods", {"queries": ["cooked basmati rice"]})
+    cand = json.loads(result[0][0].text)[0]["candidates"][0]
+    assert cand["serving_id"] == "4723850" and cand["serving_grams"] == 100.0
+    assert cand["per_100g"] == {"calories": 121.0, "carbs_g": 25.2, "protein_g": 3.5, "fat_g": 0.4}

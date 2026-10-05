@@ -68,7 +68,11 @@ def resolve_weight_goal_target_date(stored_target, date, target_date=None):
 
 def _gram_serving(contents):
     """Pick the serving to use for gram-based logging: 100 g first, else any G."""
-    grams = [c for c in contents or [] if c.get("servingUnit") == "G" and c.get("servingId")]
+    # Catalog (FatSecret) servings use "g", custom foods use "G".
+    grams = [
+        c for c in contents or []
+        if str(c.get("servingUnit", "")).strip().lower() == "g" and c.get("servingId")
+    ]
     for c in grams:
         if float(c.get("numberOfUnits") or 0) == 100:
             return c
@@ -1083,11 +1087,14 @@ def register_tools(app):
         """Look up several foods in Garmin's FatSecret catalog in ONE call
 
         Use this BEFORE estimating nutrition values yourself: for each query
-        (e.g. "riz basmati cuit", "poulet grillé") it returns the best catalog
+        (e.g. "cooked basmati rice", "grilled chicken breast") it returns the best catalog
         candidates with macros normalised per 100 g, in a compact form. Pick
         the right candidate for each food, then pass its food_id, serving_id
         and serving_grams to log_meal (catalog item). If no candidate fits,
         estimate per-100 g values yourself and send a manual item instead.
+
+        Write queries in ENGLISH: the catalog is English-only (region US),
+        and French queries return mostly unrelated foods.
 
         Only candidates that have a gram-based serving are returned with
         per-100 g values; others are listed with per_100g = null and cannot
